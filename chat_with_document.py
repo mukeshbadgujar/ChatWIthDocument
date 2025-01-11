@@ -3,12 +3,35 @@ import pdfplumber
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.llms import HuggingFacePipeline
-from langchain.prompts import PromptTemplate
 from transformers import pipeline
-import os
+import re
+from datetime import datetime
 
+# Function to extract experience durations and calculate total work experience
+def calculate_total_experience(text):
+    try:
+        # Regex to extract work experience durations in "Month Year – Month Year" format
+        date_ranges = re.findall(
+            r"(\w{3,9} \d{4})\s*–\s*(\w{3,9} \d{4}|Present)",
+            text,
+        )
+
+        total_months = 0
+        for start, end in date_ranges:
+            # Convert "Present" to the current date
+            end_date = datetime.now() if end.lower() == "present" else datetime.strptime(end, "%b %Y")
+            start_date = datetime.strptime(start, "%b %Y")
+
+            # Calculate the duration in months
+            total_months += (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+
+        # Convert total months to years and months
+        years = total_months // 12
+        months = total_months % 12
+        return years, months
+    except Exception as e:
+        st.error(f"Error calculating total experience: {e}")
+        return 0, 0
 
 # Function to extract text from a PDF file
 def extract_text_from_pdf(pdf_file):
@@ -21,7 +44,6 @@ def extract_text_from_pdf(pdf_file):
     except Exception as e:
         st.error(f"Error reading PDF: {e}")
         return None
-
 
 # Function to create a vector store from text
 def create_vector_store(text):
@@ -36,34 +58,6 @@ def create_vector_store(text):
         st.error(f"Error creating vector store: {e}")
         return None
 
-
-# Function to build a QA chain
-def build_qa_chain(vector_store):
-    try:
-        qa_model = pipeline("question-answering", model="distilbert-base-uncased-distilled-squad")
-        llm = HuggingFacePipeline(pipeline=qa_model)
-
-        qa_prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template=(
-                "Use the following context to answer the question:\n\n"
-                "{context}\n\n"
-                "Question: {question}\n\n"
-                "Answer:"
-            ),
-        )
-
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=vector_store.as_retriever(),
-            chain_type_kwargs={"prompt": qa_prompt},
-        )
-        return qa_chain
-    except Exception as e:
-        st.error(f"Error building QA chain: {e}")
-        return None
-
-
 # Streamlit App Interface
 st.title("PDF Chat Application")
 
@@ -77,27 +71,39 @@ if uploaded_file:
                 st.warning("The uploaded file is too large. Only the first part of the document will be processed.")
                 pdf_text = pdf_text[:1_000_000]
 
+            # Calculate total work experience
+            years, months = calculate_total_experience(pdf_text)
+            st.write(f"**Total Work Experience:** {years} years and {months} months")
+
             vector_store = create_vector_store(pdf_text)
             if vector_store:
-                qa_chain = build_qa_chain(vector_store)
-                if qa_chain:
-                    query = st.text_input("Ask a question about the document:")
-                    if query:
-                        try:
-                            with st.spinner("Finding the answer..."):
-                                retrieved_context = vector_store.similarity_search(query, k=1)
-                                if retrieved_context:
-                                    st.write("**Retrieved Context:**", retrieved_context[0].page_content)
-                                else:
-                                    st.warning("No relevant context found in the document.")
+                query = st.text_input("Ask a question about the document:")
+                if query:
+                    try:
+                        with st.spinner("Finding the answer..."):
+                            # Retrieve the most relevant context
+                            retrieved_context = vector_store.similarity_search(query, k=1)
+                            if not retrieved_context:
+                                st.warning("No relevant context found in the document. Please try a different question.")
+                            else:
+                                context = retrieved_context[0].page_content
+                                st.write("**Retrieved Context:**", context)
 
-                                response = qa_chain.run(query)
-                                if response.strip():
-                                    st.write("**Answer:**", response)
+                                # Split context if too large
+                                if len(context) > 512:
+                                    st.warning("Context is too large; truncating to fit the model's input size.")
+                                    context = context[:512]
+
+                                # Use Hugging Face QA model directly
+                                qa_model = pipeline("question-answering", model="distilbert-base-uncased-distilled-squad")
+                                response = qa_model({"question": query, "context": context})
+
+                                if response and "answer" in response:
+                                    st.write("**Answer:**", response["answer"])
                                 else:
                                     st.write("I'm sorry, I couldn't find an answer to your question.")
-                        except Exception as e:
-                            st.error(f"Error during QA: {e}")
+                    except Exception as e:
+                        st.error(f"Error during QA processing: {e}")
 
 # Error handling for no file uploaded
 if not uploaded_file:
